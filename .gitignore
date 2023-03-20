@@ -3,9 +3,12 @@ VOCdevkit
 checkpoints
 .vscode
 *.pyc
+*.pth
+*.png
 .idea/
 __pycache__
 results
 checkpoints_bak
 cityscapes
 test_results
+.*tar

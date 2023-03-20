@@ -13,11 +13,15 @@ from metrics import StreamSegMetrics
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from utils.visualizer import Visualizer
 
 from PIL import Image
 import matplotlib
 import matplotlib.pyplot as plt
+
+from kornia.filters import MedianBlur
+#import ufp.image
 
 
 def get_argparser():
@@ -36,7 +40,7 @@ def get_argparser():
                               not (name.startswith("__") or name.startswith('_')) and callable(
                               network.modeling.__dict__[name])
                               )
-    parser.add_argument("--model", type=str, default='deeplabv3plus_mobilenet',
+    parser.add_argument("--model", type=str, default='deeplabv3plus_resnet50',
                         choices=available_models, help='model name')
     parser.add_argument("--separable_conv", action='store_true', default=False,
                         help="apply separable conv to decoder and aspp")
@@ -46,7 +50,7 @@ def get_argparser():
     parser.add_argument("--test_only", action='store_true', default=False)
     parser.add_argument("--save_val_results", action='store_true', default=False,
                         help="save segmentation results to \"./results\"")
-    parser.add_argument("--save_dir", type=str, default='./results',
+    parser.add_argument("--save_dir", type=str, default='./results/defend/',
                         help="dir to save results")
     parser.add_argument("--total_itrs", type=int, default=30e3,
                         help="epoch number (default: 30k)")
@@ -63,7 +67,7 @@ def get_argparser():
                         help='batch size for validation (default: 4)')
     parser.add_argument("--crop_size", type=int, default=513)
 
-    parser.add_argument("--ckpt", default=None, type=str,
+    parser.add_argument("--ckpt", default="checkpoints/best_deeplabv3_resnet50_voc_os16.pth", type=str,
                         help="restore from checkpoint")
     parser.add_argument("--continue_training", action='store_true', default=False)
 
@@ -95,6 +99,20 @@ def get_argparser():
                         help='env for visdom')
     parser.add_argument("--vis_num_samples", type=int, default=8,
                         help='number of samples for visualization (default: 8)')
+
+    # Adversarial attack options
+    parser.add_argument("--attack", type=str, default="cospgd", choices=["segpgd", "cospgd"],
+                        help="SegPGD attack or CosPGD attack")
+    parser.add_argument("--epsilon", type=float, default="0.03",
+                        help="epsilon for attack")
+    parser.add_argument("--alpha", type=float, default="0.15",
+                        help="alpha for attack")
+    parser.add_argument("--iterations", type=int, default="10",
+                        help="number of attack iterations")
+    parser.add_argument("--attacked_model", type=str, default="CosPGD3AT_0.15", choices=["CosPGD3AT_0.15", "CosPGD5AT_0.15", "SegPGD3AT", "SegPGD5AT"],
+                        help="SegPGD attack or CosPGD attack")
+    parser.add_argument("--defense", type=str, default="median_blur", choices=["median_blur", "color_depth"],
+                        help="type of defense to use")
     return parser
 
 
@@ -154,10 +172,21 @@ def get_dataset(opts):
                              split='val', transform=val_transform)
     return train_dst, val_dst
 
+# FGSM attack code
+def fgsm_attack(image, epsilon, data_grad, clip_min, clip_max, alpha):
+    # Collect the element-wise sign of the data gradient
+    sign_data_grad = data_grad.sign()
+    # Create the perturbed image by adjusting each pixel of the input image
+    perturbed_image = image + alpha*sign_data_grad
+    # Adding clipping to maintain [0,1] range
+    perturbed_image = torch.clamp(perturbed_image, clip_min, clip_max)
+    # Return the perturbed image
+    return perturbed_image
 
-def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
+def validate(opts, model, loader, device, metrics, ret_samples_ids=None, criterion=None):
     """Do validation and return specified samples"""
     metrics.reset()
+    blur = MedianBlur((3,3))
     ret_samples = []
     if opts.save_val_results:
         if not os.path.exists(opts.save_dir + '/results'):
@@ -166,13 +195,52 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
                                    std=[0.229, 0.224, 0.225])
         img_id = 0
 
-    with torch.no_grad():
+    with torch.enable_grad():
         for i, (images, labels) in tqdm(enumerate(loader)):
 
             images = images.to(device, dtype=torch.float32)
             labels = labels.to(device, dtype=torch.long)
 
+            clip_min = images.min() - opts.epsilon
+            clip_max = images.max() + opts.epsilon
+            
+            if opts.attack == 'segpgd' or opts.attack == 'cospgd':
+                images = images + torch.FloatTensor(images.shape).uniform_(-1*opts.epsilon, opts.epsilon).cuda()
+
+            images.requires_grad = True
+            images.retain_grad()
+
             outputs = model(images)
+            
+
+            for t in range(opts.iterations):
+                loss = criterion(outputs, labels)
+
+                if opts.attack == 'segpgd':
+                    lambda_t = t/(2*opts.iterations)
+                    output_idx = torch.argmax(outputs, dim=1)
+                    loss=torch.sum(torch.where(output_idx==labels, (1-lambda_t)*loss, lambda_t*loss))/(outputs.shape[-2]*outputs.shape[-1])
+                elif opts.attack == "cospgd":
+                    #import ipdb;ipdb.set_trace()
+                    one_hot_target = torch.nn.functional.one_hot(torch.clamp(labels, labels.min(), opts.num_classes-1), num_classes=opts.num_classes).permute(0,3,1,2)
+                    eps=10**-8
+                    cossim=F.cosine_similarity(torch.sigmoid(outputs)+eps, one_hot_target+eps, dim=1, eps=10**-20)
+                    loss = torch.sum(cossim*loss)/(outputs.shape[-2]*outputs.shape[-1])
+
+                #model.zero_grad()
+                loss.backward(retain_graph=True)
+                data_grad = images.grad
+                images = fgsm_attack(images, opts.epsilon, data_grad, clip_min, clip_max, opts.alpha)
+                if t == opts.iterations-1:
+                    #with torch.no_grad():
+                    if opts.defense == 'color_depth':
+                        #images = ufp.image.changeColorDepth(images.ToPILImage(), 16).toTensor().to(device, dtype=torch.float32)
+                        images = images
+                    elif opts.defense == 'median_blur':
+                        images = blur(images)
+                outputs = model(images)
+                images.retain_grad()
+
             preds = outputs.detach().max(dim=1)[1].cpu().numpy()
             targets = labels.cpu().numpy()
 
@@ -218,8 +286,12 @@ def main():
         opts.num_classes = 19
 
     # Setup visualization
-    opts.save_dir = os.path.join(opts.save_dir, opts.model, opts.dataset)
-    opts.vis_env = opts.model + '_' + opts.dataset
+    if opts.attack == 'cospgd':
+        opts.alpha = 0.15
+    elif opts.attack == 'segpgd':
+        opts.alpha = 0.01
+    opts.save_dir = os.path.join(opts.save_dir, opts.defense, opts.model, opts.dataset, opts.attack, str(opts.iterations), opts.attacked_model, str(opts.alpha), str(opts.epsilon))
+    opts.vis_env = opts.defense + '_' + opts.attacked_model + '_' + opts.model + '_' + opts.dataset +'_'+ opts.attack +'_'+ str(opts.iterations) +'_'+ str(opts.alpha) +'_'+ str(opts.epsilon)
     vis = Visualizer(port=opts.vis_port,
                      env=opts.vis_env) if opts.enable_vis else None
     if vis is not None:  # display options
@@ -319,7 +391,7 @@ def main():
     if opts.test_only:
         model.eval()
         val_score, ret_samples = validate(
-            opts=opts, model=model, loader=val_loader, device=device, metrics=metrics, ret_samples_ids=vis_sample_id)
+            opts=opts, model=model, loader=val_loader, device=device, metrics=metrics, ret_samples_ids=vis_sample_id, criterion=criterion)
         print(metrics.to_str(val_score))
         if vis is not None:
             vis.vis_table("Metrics", val_score)

@@ -35,4 +35,4 @@ def fix_bn(model):
 
 def mkdir(path):
     if not os.path.exists(path):
-        os.mkdir(path)
+        os.makedirs(path, exist_ok=True)

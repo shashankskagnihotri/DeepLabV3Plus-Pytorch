@@ -13,6 +13,7 @@ from metrics import StreamSegMetrics
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from utils.visualizer import Visualizer
 
 from PIL import Image
@@ -77,7 +78,7 @@ def get_argparser():
                         help="random seed (default: 1)")
     parser.add_argument("--print_interval", type=int, default=10,
                         help="print interval of loss (default: 10)")
-    parser.add_argument("--val_interval", type=int, default=100,
+    parser.add_argument("--val_interval", type=int, default=10000,
                         help="epoch interval for eval (default: 100)")
     parser.add_argument("--download", action='store_true', default=False,
                         help="download datasets")
@@ -95,6 +96,16 @@ def get_argparser():
                         help='env for visdom')
     parser.add_argument("--vis_num_samples", type=int, default=8,
                         help='number of samples for visualization (default: 8)')
+
+    # Adversarial attack options
+    parser.add_argument("--attack", type=str, default="cospgd", choices=["segpgd", "cospgd"],
+                        help="SegPGD attack or CosPGD attack")
+    parser.add_argument("--epsilon", type=float, default="0.03",
+                        help="epsilon for attack")
+    parser.add_argument("--alpha", type=float, default="0.15",
+                        help="alpha for attack")
+    parser.add_argument("--iterations", type=int, default="10",
+                        help="number of attack iterations")
     return parser
 
 
@@ -154,6 +165,105 @@ def get_dataset(opts):
                              split='val', transform=val_transform)
     return train_dst, val_dst
 
+# FGSM attack code
+def fgsm_attack(image, epsilon, data_grad, clip_min, clip_max, alpha):
+    # Collect the element-wise sign of the data gradient
+    sign_data_grad = data_grad.sign()
+    # Create the perturbed image by adjusting each pixel of the input image
+    perturbed_image = image + alpha*sign_data_grad
+    # Adding clipping to maintain [0,1] range
+    perturbed_image = torch.clamp(perturbed_image, clip_min, clip_max)
+    # Return the perturbed image
+    return perturbed_image
+
+"""
+def validate(opts, model, loader, device, metrics, ret_samples_ids=None, criterion=None):
+    """ #Do validation and return specified samples
+"""
+    metrics.reset()
+    ret_samples = []
+    if opts.save_val_results:
+        if not os.path.exists(opts.save_dir + '/results'):
+            os.makedirs(opts.save_dir + '/results', exist_ok=True)
+        denorm = utils.Denormalize(mean=[0.485, 0.456, 0.406],
+                                   std=[0.229, 0.224, 0.225])
+        img_id = 0
+
+    with torch.enable_grad():
+        for i, (images, labels) in tqdm(enumerate(loader)):
+
+            images = images.to(device, dtype=torch.float32)
+            labels = labels.to(device, dtype=torch.long)
+
+            clip_min = images.min() - opts.epsilon
+            clip_max = images.max() + opts.epsilon
+            
+            if opts.attack == 'segpgd' or opts.attack == 'cospgd':
+                images = images + torch.FloatTensor(images.shape).uniform_(-1*opts.epsilon, opts.epsilon).cuda()
+
+            images.requires_grad = True
+            images.retain_grad()
+
+            outputs = model(images)
+            
+
+            for t in range(opts.iterations):
+                loss = criterion(outputs, labels)
+
+                if opts.attack == 'segpgd':
+                    lambda_t = t/(2*opts.iterations)
+                    output_idx = torch.argmax(outputs, dim=1)
+                    loss=torch.sum(torch.where(output_idx==labels, (1-lambda_t)*loss, lambda_t*loss))/(outputs.shape[-2]*outputs.shape[-1])
+                elif opts.attack == "cospgd":
+                    #import ipdb;ipdb.set_trace()
+                    one_hot_target = torch.nn.functional.one_hot(torch.clamp(labels, labels.min(), opts.num_classes-1), num_classes=opts.num_classes).permute(0,3,1,2)
+                    eps=10**-8
+                    cossim=F.cosine_similarity(torch.sigmoid(outputs)+eps, one_hot_target+eps, dim=1, eps=10**-20)
+                    loss = torch.sum(cossim*loss)/(outputs.shape[-2]*outputs.shape[-1])
+
+                #model.zero_grad()
+                loss.backward(retain_graph=True)
+                data_grad = images.grad
+                images = fgsm_attack(images, opts.epsilon, data_grad, clip_min, clip_max, opts.alpha)
+                outputs = model(images)
+                images.retain_grad()
+
+            preds = outputs.detach().max(dim=1)[1].cpu().numpy()
+            targets = labels.cpu().numpy()
+
+            metrics.update(targets, preds)
+            if ret_samples_ids is not None and i in ret_samples_ids:  # get vis samples
+                ret_samples.append(
+                    (images[0].detach().cpu().numpy(), targets[0], preds[0]))
+
+            if opts.save_val_results:
+                for i in range(len(images)):
+                    image = images[i].detach().cpu().numpy()
+                    target = targets[i]
+                    pred = preds[i]
+
+                    image = (denorm(image) * 255).transpose(1, 2, 0).astype(np.uint8)
+                    target = loader.dataset.decode_target(target).astype(np.uint8)
+                    pred = loader.dataset.decode_target(pred).astype(np.uint8)
+
+                    Image.fromarray(image).save(opts.save_dir + '/results/%d_image.png' % img_id)
+                    Image.fromarray(target).save(opts.save_dir + '/results/%d_target.png' % img_id)
+                    Image.fromarray(pred).save(opts.save_dir + '/results/%d_pred.png' % img_id)
+
+                    fig = plt.figure()
+                    plt.imshow(image)
+                    plt.axis('off')
+                    plt.imshow(pred, alpha=0.7)
+                    ax = plt.gca()
+                    ax.xaxis.set_major_locator(matplotlib.ticker.NullLocator())
+                    ax.yaxis.set_major_locator(matplotlib.ticker.NullLocator())
+                    plt.savefig(opts.save_dir + '/results/%d_overlay.png' % img_id, bbox_inches='tight', pad_inches=0)
+                    plt.close()
+                    img_id += 1
+
+        score = metrics.get_results()
+    return score, ret_samples
+"""
 
 def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
     """Do validation and return specified samples"""
@@ -218,8 +328,12 @@ def main():
         opts.num_classes = 19
 
     # Setup visualization
-    opts.save_dir = os.path.join(opts.save_dir, opts.model, opts.dataset)
-    opts.vis_env = opts.model + '_' + opts.dataset
+    #if opts.attack == 'cospgd':
+    #    opts.alpha = 0.01
+    #elif opts.attack == 'segpgd':
+    #    opts.alpha = 0.01
+    opts.save_dir = os.path.join(opts.save_dir, 'training', opts.model, opts.dataset, opts.attack, str(opts.iterations), str(opts.alpha), str(opts.epsilon))
+    opts.vis_env = 'training' + opts.model + '_' + opts.dataset +'_'+ opts.attack +'_'+ str(opts.iterations) +'_'+ str(opts.alpha) +'_'+ str(opts.epsilon)
     vis = Visualizer(port=opts.vis_port,
                      env=opts.vis_env) if opts.enable_vis else None
     if vis is not None:  # display options
@@ -341,7 +455,44 @@ def main():
             images = images.to(device, dtype=torch.float32)
             labels = labels.to(device, dtype=torch.long)
 
+            clip_min = images.min() - opts.epsilon
+            clip_max = images.max() + opts.epsilon
+
+            images_adv = images[:int(len(images)/2)]
+            labels_adv = labels[:int(len(images)/2)]
+            
+            if opts.attack == 'segpgd' or opts.attack == 'cospgd':
+                images_adv = images_adv + torch.FloatTensor(images_adv.shape).uniform_(-1*opts.epsilon, opts.epsilon).cuda()
+
+            images_adv.requires_grad = True
+            images_adv.retain_grad()
+
+            outputs = model(images_adv)
+            
+
+            for t in range(opts.iterations):
+                loss = criterion(outputs, labels_adv)
+
+                if opts.attack == 'segpgd':
+                    lambda_t = t/(2*opts.iterations)
+                    output_idx = torch.argmax(outputs, dim=1)
+                    loss=torch.sum(torch.where(output_idx==labels_adv, (1-lambda_t)*loss, lambda_t*loss))/(outputs.shape[-2]*outputs.shape[-1])
+                elif opts.attack == "cospgd":
+                    #import ipdb;ipdb.set_trace()
+                    one_hot_target = torch.nn.functional.one_hot(torch.clamp(labels_adv, labels_adv.min(), opts.num_classes-1), num_classes=opts.num_classes).permute(0,3,1,2)
+                    eps=10**-8
+                    cossim=F.cosine_similarity(torch.sigmoid(outputs)+eps, one_hot_target+eps, dim=1, eps=10**-20)
+                    loss = torch.sum(cossim*loss)/(outputs.shape[-2]*outputs.shape[-1])
+
+                #model.zero_grad()
+                loss.backward(retain_graph=True)
+                data_grad = images_adv.grad
+                images_adv = fgsm_attack(images_adv, opts.epsilon, data_grad, clip_min, clip_max, opts.alpha)
+                outputs = model(images_adv)
+                images_adv.retain_grad()
+
             optimizer.zero_grad()
+            images[:int(len(images)/2)]=images_adv
             outputs = model(images)
             loss = criterion(outputs, labels)
             loss.backward()
@@ -358,7 +509,7 @@ def main():
                       (cur_epochs, cur_itrs, opts.total_itrs, interval_loss))
                 interval_loss = 0.0
 
-            if (cur_itrs) % opts.val_interval == 0:
+            if (cur_itrs) % opts.val_interval*100 == 0:
                 save_ckpt(opts.save_dir + '/checkpoints/latest_%s_%s_os%d.pth' %
                           (opts.model, opts.dataset, opts.output_stride))
                 print("validation...")
