@@ -48,7 +48,7 @@ def get_argparser():
     parser.add_argument("--test_only", action='store_true', default=False)
     parser.add_argument("--save_val_results", action='store_true', default=False,
                         help="save segmentation results to \"./results\"")
-    parser.add_argument("--save_dir", type=str, default='./results/transfer_attack/',
+    parser.add_argument("--save_dir", type=str, default='./results/final_transfer_attack/',
                         help="dir to save results")
     parser.add_argument("--total_itrs", type=int, default=30e3,
                         help="epoch number (default: 30k)")
@@ -187,10 +187,16 @@ def validate(opts, deeplab_model, pspnet_model, loader, device, metrics, ret_sam
     ret_samples = []
     if opts.attacked_model == 'deeplabv3_resnet50':
         attacked_model = deeplab_model
-        attacking_model = pspnet_model
+        #attacking_model = pspnet_model
     elif opts.attacked_model == 'pspnet_resnet50':
         attacked_model = pspnet_model
+        #attacking_model = deeplab_model
+    if opts.attacking_model == 'deeplabv3_resnet50':
         attacking_model = deeplab_model
+        #attacking_model = pspnet_model
+    elif opts.attacking_model == 'pspnet_resnet50':
+        attacking_model = pspnet_model
+        #attacking_model = deeplab_model
     if opts.save_val_results:
         if not os.path.exists(opts.save_dir + '/results'):
             os.makedirs(opts.save_dir + '/results', exist_ok=True)
@@ -388,9 +394,13 @@ def main():
 
     
     pspnet_model = PSPNet(layers=50, classes=opts.num_classes, zoom_factor=8, pretrained=False)
+    
+    pspnet_model = nn.DataParallel(pspnet_model)
+    pspnet_model.module.cls[0]=torch.nn.Conv2d(in_channels=pspnet_model.module.cls[0].in_channels, out_channels=pspnet_model.module.cls[0].out_channels, 
+                                            kernel_size=pspnet_model.module.cls[0].kernel_size, stride=pspnet_model.module.cls[0].stride, 
+                                            padding=pspnet_model.module.cls[0].padding, groups=1).cuda()
     checkpoint = torch.load("checkpoints/train_epoch_50.pth")
     pspnet_model.load_state_dict(checkpoint['state_dict'], strict=False)
-    pspnet_model = nn.DataParallel(pspnet_model)
     print("PSPNet Model restored from checkpoints/train_epoch_50.pth")
     pspnet_model.to(device)
 
