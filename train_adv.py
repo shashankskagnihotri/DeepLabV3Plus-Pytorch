@@ -47,7 +47,7 @@ def get_argparser():
     parser.add_argument("--test_only", action='store_true', default=False)
     parser.add_argument("--save_val_results", action='store_true', default=False,
                         help="save segmentation results to \"./results\"")
-    parser.add_argument("--save_dir", type=str, default='./results',
+    parser.add_argument("--save_dir", type=str, default='./testing_new_neurips_results',
                         help="dir to save results")
     parser.add_argument("--total_itrs", type=int, default=30e3,
                         help="epoch number (default: 30k)")
@@ -102,7 +102,7 @@ def get_argparser():
                         help="SegPGD attack or CosPGD attack")
     parser.add_argument("--epsilon", type=float, default="0.03",
                         help="epsilon for attack")
-    parser.add_argument("--alpha", type=float, default="0.15",
+    parser.add_argument("--alpha", type=float, default="0.01",
                         help="alpha for attack")
     parser.add_argument("--iterations", type=int, default="10",
                         help="number of attack iterations")
@@ -387,7 +387,7 @@ def main():
     if opts.loss_type == 'focal_loss':
         criterion = utils.FocalLoss(ignore_index=255, size_average=True)
     elif opts.loss_type == 'cross_entropy':
-        criterion = nn.CrossEntropyLoss(ignore_index=255, reduction='mean')
+        criterion = nn.CrossEntropyLoss(ignore_index=255, reduction='none')
 
     def save_ckpt(path):
         """ save current model
@@ -482,7 +482,10 @@ def main():
                     one_hot_target = torch.nn.functional.one_hot(torch.clamp(labels_adv, labels_adv.min(), opts.num_classes-1), num_classes=opts.num_classes).permute(0,3,1,2)
                     eps=10**-8
                     cossim=F.cosine_similarity(torch.sigmoid(outputs)+eps, one_hot_target+eps, dim=1, eps=10**-20)
-                    loss = torch.sum(cossim*loss)/(outputs.shape[-2]*outputs.shape[-1])
+                    loss = torch.sum(cossim.detach()*loss)/(outputs.shape[-2]*outputs.shape[-1])
+                    #with torch.no_grad():
+                    #    loss *= torch.sum(cossim)
+                    #    loss /= outputs.shape[-2]*outputs.shape[-1]
 
                 #model.zero_grad()
                 loss.backward(retain_graph=True)
@@ -494,7 +497,8 @@ def main():
             optimizer.zero_grad()
             images[:int(len(images)/2)]=images_adv
             outputs = model(images)
-            loss = criterion(outputs, labels)
+            loss = criterion(outputs, labels)      
+            loss = loss.mean()      
             loss.backward()
             optimizer.step()
 

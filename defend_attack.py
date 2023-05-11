@@ -49,8 +49,8 @@ def get_argparser():
     # Train Options
     parser.add_argument("--test_only", action='store_true', default=False)
     parser.add_argument("--save_val_results", action='store_true', default=False,
-                        help="save segmentation results to \"./results\"")
-    parser.add_argument("--save_dir", type=str, default='./results/defend/',
+                        help="save segmentation results to \"./neurips_results/defend\"")
+    parser.add_argument("--save_dir", type=str, default='./neurips_results/defend/',
                         help="dir to save results")
     parser.add_argument("--total_itrs", type=int, default=30e3,
                         help="epoch number (default: 30k)")
@@ -109,7 +109,7 @@ def get_argparser():
                         help="alpha for attack")
     parser.add_argument("--iterations", type=int, default="10",
                         help="number of attack iterations")
-    parser.add_argument("--attacked_model", type=str, default="CosPGD3AT_0.15", choices=["CosPGD3AT_0.15", "CosPGD5AT_0.15", "SegPGD3AT", "SegPGD5AT"],
+    parser.add_argument("--attacked_model", type=str, default="Baseline", choices=["Baseline", "CosPGD3AT_0.01", "CosPGD5AT_0.01", "CosPGD3AT_0.05", "CosPGD5AT_0.05", "CosPGD3AT_0.15", "CosPGD5AT_0.15", "SegPGD3AT", "SegPGD5AT"],
                         help="SegPGD attack or CosPGD attack")
     parser.add_argument("--defense", type=str, default="median_blur", choices=["median_blur", "color_depth"],
                         help="type of defense to use")
@@ -225,9 +225,14 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None, criteri
                     one_hot_target = torch.nn.functional.one_hot(torch.clamp(labels, labels.min(), opts.num_classes-1), num_classes=opts.num_classes).permute(0,3,1,2)
                     eps=10**-8
                     cossim=F.cosine_similarity(torch.sigmoid(outputs)+eps, one_hot_target+eps, dim=1, eps=10**-20)
-                    loss = torch.sum(cossim*loss)/(outputs.shape[-2]*outputs.shape[-1])
+                    #loss = torch.sum(cossim*loss)/(outputs.shape[-2]*outputs.shape[-1])
+                    loss = torch.sum(cossim.detach()*loss)/(outputs.shape[-2]*outputs.shape[-1])
+                    #with torch.no_grad():
+                    #    loss *= torch.sum(cossim)
+                    #    loss /= outputs.shape[-2]*outputs.shape[-1]
 
                 #model.zero_grad()
+                loss = loss.mean()
                 loss.backward(retain_graph=True)
                 data_grad = images.grad
                 images = fgsm_attack(images, opts.epsilon, data_grad, clip_min, clip_max, opts.alpha)
@@ -287,7 +292,8 @@ def main():
 
     # Setup visualization
     if opts.attack == 'cospgd':
-        opts.alpha = 0.15
+        #opts.alpha = 0.15
+        opts.alpha = 0.03
     elif opts.attack == 'segpgd':
         opts.alpha = 0.01
     opts.save_dir = os.path.join(opts.save_dir, opts.defense, opts.model, opts.dataset, opts.attack, str(opts.iterations), opts.attacked_model, str(opts.alpha), str(opts.epsilon))
@@ -345,7 +351,7 @@ def main():
     if opts.loss_type == 'focal_loss':
         criterion = utils.FocalLoss(ignore_index=255, size_average=True)
     elif opts.loss_type == 'cross_entropy':
-        criterion = nn.CrossEntropyLoss(ignore_index=255, reduction='mean')
+        criterion = nn.CrossEntropyLoss(ignore_index=255, reduction='none')
 
     def save_ckpt(path):
         """ save current model
